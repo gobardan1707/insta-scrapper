@@ -3,13 +3,14 @@ const express = require('express');
 const { addExtra } = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const puppeteer = require('puppeteer-core');
+const chromium = require('chromium'); 
 
 const browserExtra = addExtra(puppeteer);
 browserExtra.use(StealthPlugin());
 
-const BRAVE_PATH = process.env.BRAVE_PATH || 'C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe';
+const BRAVE_PATH = process.env.BRAVE_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 const PORT = process.env.PORT || 3000;
-const DEFAULT_SAMPLE_SIZE = 5;  // changed default to 5
+const DEFAULT_SAMPLE_SIZE = 5;
 
 const app = express();
 app.use(express.json());
@@ -24,8 +25,8 @@ function normalizeUserFromGraphql(data) {
     if (!obj || typeof obj !== 'object') return null;
     if (obj.graphql && obj.graphql.user) return obj.graphql.user;
     if (obj.data && obj.data.user) return obj.data.user;
-    if (obj.entry_data && Array.isArray(obj.entry_data.ProfilePage) &&
-        obj.entry_data.ProfilePage[0]?.graphql?.user) {
+    if (obj.entry_data && Array.isArray(obj.entry_data.ProfilePage)
+        && obj.entry_data.ProfilePage[0]?.graphql?.user) {
       return obj.entry_data.ProfilePage[0].graphql.user;
     }
     for (const k of Object.keys(obj)) {
@@ -78,7 +79,7 @@ function computeAnalytics(posts, followers = 0, sampleSize = DEFAULT_SAMPLE_SIZE
   const slice = posts.filter(p => p != null).slice(0, sampleSize);
   const likes = slice.map(p => Number(p.likes || 0));
   const comments = slice.map(p => Number(p.comments || 0));
-  const mean = arr => arr.length ? Math.round(arr.reduce((a,b) => a + b, 0) / arr.length) : 0;
+  const mean = arr => arr.length ? Math.round(arr.reduce((a,b)=>a + b, 0) / arr.length) : 0;
   const avgLikes = mean(likes);
   const avgComments = mean(comments);
   const engagementRate = (followers && followers > 0)
@@ -87,17 +88,37 @@ function computeAnalytics(posts, followers = 0, sampleSize = DEFAULT_SAMPLE_SIZE
   return { sample_size: slice.length, avg_likes: avgLikes, avg_comments: avgComments, engagement_rate_pct: engagementRate };
 }
 
-async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options = {}) {
-  console.log(`[scrape] start username=${username} sample=${sampleSize}`);
-
-  const browser = await browserExtra.launch({
-    headless: options.headless ?? 'new',
-    executablePath: options.executablePath || BRAVE_PATH,
+// reuse one browser
+let globalBrowser = null;
+async function getBrowser() {
+  if (globalBrowser) return globalBrowser;
+  globalBrowser = await browserExtra.launch({
+    headless: true,
+    executablePath:chromium.path,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
     defaultViewport: { width: 1200, height: 800 }
   });
+  return globalBrowser;
+}
 
+async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options = {}) {
+  console.log(`[scrape] start username=${username} sample=${sampleSize}`);
+  const browser = await getBrowser();
+
+  // --- Step 1: Scrape profile and close the page ---
   const page = await browser.newPage();
+
+  // block unnecessary resources
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    const typ = req.resourceType();
+    if (['stylesheet', 'font', 'media', 'preload'].includes(typ)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
   await page.setUserAgent(options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
 
@@ -123,14 +144,13 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
         }
       }
       if (json) {
-        console.log('[resp-captured] url=', url, ' keys=', Object.keys(json).slice(0,5));
+        console.log('[resp-captured] url=', url, 'keys=', Object.keys(json).slice(0,5));
         capturedJsons.push({ url, json });
       }
     }
   });
 
   const profileUrl = `https://www.instagram.com/${encodeURIComponent(username)}/`;
-  console.log('[scrape] goto', profileUrl);
   await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
   try {
@@ -144,6 +164,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   }
   await sleep(800);
 
+  // fallback via evaluate fetch if needed
   try {
     const webInfo = await page.evaluate(async uname => {
       try {
@@ -170,6 +191,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
     console.warn('[fallback] fetch error', e.message);
   }
 
+  // inline JSON fallback
   try {
     const embedded = await page.evaluate(() => {
       const scripts = Array.from(document.scripts || []);
@@ -193,6 +215,10 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
     console.warn('[embedded eval]', e.message);
   }
 
+  // close profile page before post scraping
+  await page.close();
+
+  // normalize profile
   let normalized = null;
   for (const c of capturedJsons) {
     const maybe = normalizeUserFromGraphql(c.json);
@@ -215,93 +241,119 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   }
 
   if (!normalized) {
-    await browser.close();
     throw new Error('Normalized profile not found');
   }
 
+  // --- Step 2: Parallel scrape post pages ---
+  const targets = normalized.posts.slice(0, sampleSize);
+  const maxConcurrency = 3;
+  const pages = [];
+  for (let i = 0; i < maxConcurrency; i++) {
+    const p = await browser.newPage();
+    await p.setRequestInterception(true);
+    p.on('request', req => {
+      const typ = req.resourceType();
+      if (['stylesheet', 'font', 'media', 'preload'].includes(typ)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+    pages.push(p);
+  }
+
+  let idx = 0;
   const postDetails = [];
-  for (const post of normalized.posts.slice(0, sampleSize)) {
-    const sc = post.shortcode || post.id;
-    if (!sc) continue;
-    try {
-      const url = `https://www.instagram.com/p/${sc}/`;
-      console.log('[post navigate]', url);
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-      const detail = await page.evaluate(() => {
-        const result = { thumbnail: null, caption: null };
-        const ogImg = document.querySelector('meta[property="og:image"]');
-        if (ogImg && ogImg.content) {
-          result.thumbnail = ogImg.content;
-        }
+  async function worker(page) {
+    while (idx < targets.length) {
+      const current = idx++;
+      const post = targets[current];
+      const sc = post.shortcode || post.id;
+      if (!sc) continue;
+      try {
+        const url = `https://www.instagram.com/p/${sc}/`;
+        console.log('[post navigate]', url);
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        try {
-          const scripts = Array.from(document.scripts);
-          for (const s of scripts) {
-            const txt = s.textContent || '';
-            if (txt.includes('edge_media_to_caption') || txt.includes('shortcode_media')) {
-              const f = txt.indexOf('{'), l = txt.lastIndexOf('}');
-              if (f >= 0 && l > f) {
-                const obj = JSON.parse(txt.slice(f, l + 1));
-                let media = obj;
-                if (media.entry_data?.PostPage) {
-                  media = media.entry_data.PostPage[0].graphql.shortcode_media;
-                } else if (media.graphql?.shortcode_media) {
-                  media = media.graphql.shortcode_media;
+        const detail = await page.evaluate(() => {
+          const result = { thumbnail: null, caption: null };
+          const ogImg = document.querySelector('meta[property="og:image"]');
+          if (ogImg && ogImg.content) {
+            result.thumbnail = ogImg.content;
+          }
+          try {
+            const scripts = Array.from(document.scripts);
+            for (const s of scripts) {
+              const txt = s.textContent || '';
+              if (txt.includes('edge_media_to_caption') || txt.includes('shortcode_media')) {
+                const f = txt.indexOf('{'), l = txt.lastIndexOf('}');
+                if (f >= 0 && l > f) {
+                  const obj = JSON.parse(txt.slice(f, l + 1));
+                  let media = obj;
+                  if (media.entry_data?.PostPage) {
+                    media = media.entry_data.PostPage[0].graphql.shortcode_media;
+                  } else if (media.graphql?.shortcode_media) {
+                    media = media.graphql.shortcode_media;
+                  }
+                  if (media.edge_media_to_caption?.edges?.length > 0) {
+                    result.caption = media.edge_media_to_caption.edges[0].node.text;
+                  }
+                  if (media.display_url) {
+                    result.thumbnail = media.display_url;
+                  }
+                  break;
                 }
-                if (media.edge_media_to_caption?.edges?.length > 0) {
-                  result.caption = media.edge_media_to_caption.edges[0].node.text;
-                }
-                if (media.display_url) {
-                  result.thumbnail = media.display_url;
-                }
-                break;
               }
             }
+          } catch (e) {
+            console.warn('script parse error', e.message);
           }
-        } catch (e) {
-          console.warn('script parse error', e.message);
-        }
 
-        if (result.caption == null) {
-          const ogTitle = document.querySelector('meta[property="og:title"]');
-          if (ogTitle && ogTitle.content) {
-            let c = ogTitle.content;
-            const parts = c.split(' on Instagram: ');
-            if (parts.length > 1) {
-              c = parts[1];
+          if (result.caption == null) {
+            const ogTitle = document.querySelector('meta[property="og:title"]');
+            if (ogTitle && ogTitle.content) {
+              let c = ogTitle.content;
+              const parts = c.split(' on Instagram: ');
+              if (parts.length > 1) {
+                c = parts[1];
+              }
+              c = c.replace(/^"|"$/g, '');
+              result.caption = c;
             }
-            c = c.replace(/^"|"$/g, '');
-            result.caption = c;
           }
-        }
 
-        if (result.caption == null) {
-          const capDiv = document.querySelector('div.C4VMK > span');
-          if (capDiv) {
-            result.caption = capDiv.innerText;
+          if (result.caption == null) {
+            const capDiv = document.querySelector('div.C4VMK > span');
+            if (capDiv) {
+              result.caption = capDiv.innerText;
+            }
           }
-        }
 
-        return result;
-      });
+          return result;
+        });
 
-      console.log('[post-detail]', sc, detail);
-      postDetails.push({ shortcode: sc, ...detail });
-    } catch (e) {
-      console.warn('[post error]', sc, e.message);
+        console.log('[post-detail]', sc, detail);
+        postDetails.push({ shortcode: sc, ...detail });
+      } catch (e) {
+        console.warn('[post error]', sc, e.message);
+      }
     }
   }
 
-  await browser.close();
+  // run workers in parallel
+  await Promise.all(pages.map(p => worker(p)));
+  // close pages
+  await Promise.all(pages.map(p => p.close()));
 
-  const merged = normalized.posts.slice(0, sampleSize).map(r => {
+  // merge postResults
+  const merged = targets.map(r => {
     const sc = r.shortcode || r.id;
     const det = postDetails.find(d => d.shortcode === sc);
     return {
       id: sc,
-      caption: det?.caption || null,
       thumbnail: det?.thumbnail || null,
+      caption: det?.caption || null,
       likes: r.likes,
       comments: r.comments
     };
@@ -340,5 +392,5 @@ app.get('/api/profile/:username', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[server] listening on http://localhost:${PORT} — Brave path: ${BRAVE_PATH}`);  
+  console.log(`[server] listening on http://localhost:${PORT} — Brave path: ${BRAVE_PATH}`);
 });
