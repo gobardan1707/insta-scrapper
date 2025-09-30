@@ -3,12 +3,12 @@ const express = require('express');
 const { addExtra } = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const puppeteer = require('puppeteer-core');
-const chromium = require('chromium'); 
+const chromium = require('chromium');
 
 const browserExtra = addExtra(puppeteer);
 browserExtra.use(StealthPlugin());
 
-const BRAVE_PATH = process.env.BRAVE_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe";
+const BRAVE_PATH = process.env.BRAVE_PATH || chromium.path;  // use chromium.path fallback
 const PORT = process.env.PORT || 3000;
 const DEFAULT_SAMPLE_SIZE = 5;
 
@@ -17,7 +17,11 @@ app.use(express.json());
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function safeParseJSON(s) {
-  try { return JSON.parse(s); } catch (e) { return null; }
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
 }
 
 function normalizeUserFromGraphql(data) {
@@ -94,8 +98,12 @@ async function getBrowser() {
   if (globalBrowser) return globalBrowser;
   globalBrowser = await browserExtra.launch({
     headless: true,
-    executablePath:chromium.path,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+    executablePath: BRAVE_PATH,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled'
+    ],
     defaultViewport: { width: 1200, height: 800 }
   });
   return globalBrowser;
@@ -105,10 +113,10 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   console.log(`[scrape] start username=${username} sample=${sampleSize}`);
   const browser = await getBrowser();
 
-  // --- Step 1: Scrape profile and close the page ---
+  // Step 1: Scrape profile
   const page = await browser.newPage();
 
-  // block unnecessary resources
+  // block some resources to speed up
   await page.setRequestInterception(true);
   page.on('request', req => {
     const typ = req.resourceType();
@@ -125,7 +133,11 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   const capturedJsons = [];
   page.on('response', async resp => {
     const url = resp.url();
-    if (url.includes('/api/v1/users/web_profile_info') || url.includes('/api/graphql/') || url.includes('/graphql/')) {
+    if (
+      url.includes('/api/v1/users/web_profile_info') ||
+      url.includes('/api/graphql/') ||
+      url.includes('/graphql/')
+    ) {
       let text = null;
       try {
         text = await resp.text();
@@ -151,12 +163,16 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   });
 
   const profileUrl = `https://www.instagram.com/${encodeURIComponent(username)}/`;
-  await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   try {
     await page.waitForResponse(r => {
       const u = r.url();
-      return u.includes('/api/v1/users/web_profile_info') || u.includes('/api/graphql/') || u.includes('/graphql/');
+      return (
+        u.includes('/api/v1/users/web_profile_info') ||
+        u.includes('/api/graphql/') ||
+        u.includes('/graphql/')
+      );
     }, { timeout: 6000 });
     console.log('[scrape] saw metadata response');
   } catch (e) {
@@ -164,7 +180,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
   }
   await sleep(800);
 
-  // fallback via evaluate fetch if needed
+  // fallback fetch
   try {
     const webInfo = await page.evaluate(async uname => {
       try {
@@ -183,6 +199,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
         return { _err: err.message };
       }
     }, username);
+
     if (webInfo && webInfo.data) {
       console.log('[fallback] keys', Object.keys(webInfo).slice(0,5));
       capturedJsons.push({ url: 'web_profile_info_fallback', json: webInfo });
@@ -198,10 +215,13 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
       for (const s of scripts) {
         const txt = (s.textContent || '').trim();
         if (txt.includes('edge_owner_to_timeline_media') || txt.includes('graphql')) {
-          const f = txt.indexOf('{'), l = txt.lastIndexOf('}');
+          const f = txt.indexOf('{');
+          const l = txt.lastIndexOf('}');
           if (f >= 0 && l > f) {
             const cand = txt.slice(f, l + 1);
-            try { return JSON.parse(cand); } catch (_) {}
+            try {
+              return JSON.parse(cand);
+            } catch (_) {}
           }
         }
       }
@@ -215,10 +235,9 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
     console.warn('[embedded eval]', e.message);
   }
 
-  // close profile page before post scraping
   await page.close();
 
-  // normalize profile
+  // normalize
   let normalized = null;
   for (const c of capturedJsons) {
     const maybe = normalizeUserFromGraphql(c.json);
@@ -244,7 +263,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
     throw new Error('Normalized profile not found');
   }
 
-  // --- Step 2: Parallel scrape post pages ---
+  // Step 2 — parallel scrape posts
   const targets = normalized.posts.slice(0, sampleSize);
   const maxConcurrency = 3;
   const pages = [];
@@ -274,10 +293,15 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
       try {
         const url = `https://www.instagram.com/p/${sc}/`;
         console.log('[post navigate]', url);
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         const detail = await page.evaluate(() => {
-          const result = { thumbnail: null, caption: null };
+          const result = {
+            thumbnail: null,
+            fullImage: null,
+            caption: null
+          };
+          // meta tag for image
           const ogImg = document.querySelector('meta[property="og:image"]');
           if (ogImg && ogImg.content) {
             result.thumbnail = ogImg.content;
@@ -286,8 +310,9 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
             const scripts = Array.from(document.scripts);
             for (const s of scripts) {
               const txt = s.textContent || '';
-              if (txt.includes('edge_media_to_caption') || txt.includes('shortcode_media')) {
-                const f = txt.indexOf('{'), l = txt.lastIndexOf('}');
+              if (txt.includes('shortcode_media') || txt.includes('edge_media_to_caption')) {
+                const f = txt.indexOf('{');
+                const l = txt.lastIndexOf('}');
                 if (f >= 0 && l > f) {
                   const obj = JSON.parse(txt.slice(f, l + 1));
                   let media = obj;
@@ -296,11 +321,17 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
                   } else if (media.graphql?.shortcode_media) {
                     media = media.graphql.shortcode_media;
                   }
+                  // caption
                   if (media.edge_media_to_caption?.edges?.length > 0) {
                     result.caption = media.edge_media_to_caption.edges[0].node.text;
                   }
+                  // full image url (display_url gives full)
                   if (media.display_url) {
-                    result.thumbnail = media.display_url;
+                    result.fullImage = media.display_url;
+                  }
+                  // alternative: thumbnail_src or display_resources
+                  if (!result.fullImage && media.thumbnail_src) {
+                    result.fullImage = media.thumbnail_src;
                   }
                   break;
                 }
@@ -309,7 +340,7 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
           } catch (e) {
             console.warn('script parse error', e.message);
           }
-
+          // fallback caption from og:title
           if (result.caption == null) {
             const ogTitle = document.querySelector('meta[property="og:title"]');
             if (ogTitle && ogTitle.content) {
@@ -322,14 +353,13 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
               result.caption = c;
             }
           }
-
+          // fallback caption in page if still null
           if (result.caption == null) {
             const capDiv = document.querySelector('div.C4VMK > span');
             if (capDiv) {
               result.caption = capDiv.innerText;
             }
           }
-
           return result;
         });
 
@@ -341,18 +371,16 @@ async function scrapeProfile(username, sampleSize = DEFAULT_SAMPLE_SIZE, options
     }
   }
 
-  // run workers in parallel
   await Promise.all(pages.map(p => worker(p)));
-  // close pages
   await Promise.all(pages.map(p => p.close()));
 
-  // merge postResults
   const merged = targets.map(r => {
     const sc = r.shortcode || r.id;
     const det = postDetails.find(d => d.shortcode === sc);
     return {
       id: sc,
       thumbnail: det?.thumbnail || null,
+      fullImage: det?.fullImage || null,
       caption: det?.caption || null,
       likes: r.likes,
       comments: r.comments
@@ -392,5 +420,5 @@ app.get('/api/profile/:username', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[server] listening on http://localhost:${PORT} — Brave path: ${BRAVE_PATH}`);
+  console.log(`[server] listening on port ${PORT} — Brave/Chromium path: ${BRAVE_PATH}`);
 });
