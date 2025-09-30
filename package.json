@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "chromium": "^3.0.3",
+    "cors": "^2.8.5",
     "express": "^5.1.0",
     "puppeteer-core": "^24.22.3",
     "puppeteer-extra": "^3.3.6",

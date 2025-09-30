@@ -13,6 +13,17 @@ const PORT = process.env.PORT || 3000;
 const DEFAULT_SAMPLE_SIZE = 5;
 
 const app = express();
+
+const cors = require('cors');
+const allowedOrigin = "https://frontend-sand-two-29.vercel.app";
+
+app.use(cors({
+  origin: allowedOrigin,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}));
+
 app.use(express.json());
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
